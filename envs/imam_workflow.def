@@ -1,9 +1,9 @@
 Bootstrap: docker
-From: continuumio/miniconda3
+From: cgr.dev/chainguard/wolfi-base:latest
 
 %files
-    # Relative paths from where you run 'singularity build'
-    envs/imam.tar.gz /imam.tar.gz
+    # Build from the repository root.
+    envs/environment.yml /opt/imam/environment.yml
     scripts/prepare_project.py /prepare_project.py
     scripts/post_process_diamond_v1.0.py /post_process_diamond_v1.0.py
     scripts/build_taxon_dict.py /build_taxon_dict.py
@@ -11,92 +11,117 @@ From: continuumio/miniconda3
     workflow/snakefile_imam.smk /snakefile_imam.smk
     IMAM_VERSION /IMAM_VERSION
 
-
 %post
-    # Define the target environment path using the standard container location
+    set -eu
+
+    # This definition targets linux-64 Conda packages.
+    if [ "$(uname -m)" != "x86_64" ]; then
+        echo "This definition requires an x86_64 build host." >&2
+        exit 1
+    fi
+
+    # Runtime utilities. Most bioinformatics dependencies come from Conda.
+    apk add --no-cache bash ca-certificates coreutils
+
+    # Utilities needed only during the build.
+    apk add --no-cache --virtual .imam-build-deps \
+        curl gnutar bzip2 findutils
+
     TARGET_ENV_PATH="/opt/conda/envs/imam"
+    export MAMBA_ROOT_PREFIX="/opt/imam-mamba-build"
 
-    # Verbose output and exit on error - good for debugging builds
-    set -ex
+    mkdir -p /opt/imam-build
 
-    echo "--- Creating target directory: ${TARGET_ENV_PATH} ---"
-    mkdir -p "${TARGET_ENV_PATH}"
-    ls -ld /opt/conda/ /opt/conda/envs/ # Verify parent exists
+    # Download separately so curl errors cannot be hidden by a pipeline.
+    curl --fail --location --retry 3 \
+        https://micro.mamba.pm/api/micromamba/linux-64/latest \
+        --output /opt/imam-build/micromamba.tar.bz2
 
-    echo "--- Extracting tarball /imam.tar.gz to ${TARGET_ENV_PATH} ---"
-    tar -xzf /imam.tar.gz -C "${TARGET_ENV_PATH}"
-    echo "--- Contents of target directory after tar: ---"
-    ls -l "${TARGET_ENV_PATH}"
+    tar -xjf /opt/imam-build/micromamba.tar.bz2 \
+        -C /opt/imam-build bin/micromamba
 
-    echo "--- Running conda-unpack using Python from the unpacked env ---"
-    "${TARGET_ENV_PATH}/bin/python" "${TARGET_ENV_PATH}/bin/conda-unpack"
-    echo "--- conda-unpack finished ---"
+    /opt/imam-build/bin/micromamba --no-rc create \
+        --yes \
+        --strict-channel-priority \
+        --prefix "${TARGET_ENV_PATH}" \
+        --file /opt/imam/environment.yml
 
-    echo "--- Cleaning up tarball ---"
-    rm /imam.tar.gz
+    # Record the resolved packages for inspection and future locking.
+    /opt/imam-build/bin/micromamba --no-rc list \
+        --prefix "${TARGET_ENV_PATH}" \
+        --explicit > /opt/imam/conda-linux-64.explicit.txt
 
-    # --- Modify /etc/bash.bashrc for interactive shells ---
-    echo "--- Adding conda activation to /etc/bash.bashrc ---"
-    # Use cat with a here-document to append the lines robustly
-    cat << EOF >> /etc/bash.bashrc
+    # Remove package downloads and solver caches.
+    /opt/imam-build/bin/micromamba --no-rc clean --all --yes
 
-# Added by Singularity build for automatic Conda environment activation
-if [ -f "/opt/conda/etc/profile.d/conda.sh" ]; then
-    . "/opt/conda/etc/profile.d/conda.sh"
-    conda activate myenv
-else
-    echo "WARNING: Conda setup script not found (/opt/conda/etc/profile.d/conda.sh)" >> /dev/stderr
-fi
-EOF
-    # Note: The final 'EOF' MUST be at the beginning of the line with no spaces before it.
+    # Conservative cleanup: retain libraries, metadata, and Python bytecode.
+    rm -rf \
+        "${TARGET_ENV_PATH}/share/doc" \
+        "${TARGET_ENV_PATH}/share/man" \
+        /opt/imam-build \
+        "${MAMBA_ROOT_PREFIX}"
 
-    echo "--- Contents of /etc/bash.bashrc after modification: ---"
-    cat /etc/bash.bashrc
-    echo "--- End of /etc/bash.bashrc content ---"
+    apk del .imam-build-deps
 
-    echo "--- %post section completed ---"
-
-
-# --- Keep the %environment section focused on PATH for exec/run ---
 %environment
-    # Define the environment's bin directory (for clarity)
-    ENV_BIN_DIR="/opt/conda/envs/imam/bin"
+    export PATH="/opt/conda/envs/imam/bin:${PATH}"
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
+    export PYTHONNOUSERSITE=1
+    export SSL_CERT_FILE="/etc/ssl/certs/ca-certificates.crt"
 
-    # Prepend the environment's bin directory to the PATH
-    # This ensures tools from 'myenv' are found first.
-    export PATH="${ENV_BIN_DIR}:${PATH}"
-
-    # Optional: Handle LD_LIBRARY_PATH if needed
-    # ENV_LIB_DIR="/opt/conda/envs/imam/lib"
-    # export LD_LIBRARY_PATH="${ENV_LIB_DIR}:${LD_LIBRARY_PATH}"
-
-
-# --- A dedicated runscript for version and help information ---
 %runscript
-    #!/bin/bash
-    # This runscript is for informational purposes only.
-    # The main tools are intended to be run via 'singularity exec'.
+    #!/bin/sh
+    set -eu
 
-    # Check if the first argument is '--version'
-    if [ "$1" = "--version" ]; then
-        # If it is, print the version and exit.
+    if [ "${1:-}" = "--version" ]; then
         cat /IMAM_VERSION
         exit 0
     fi
 
-    # If no valid flag is given, print a helpful usage message.
-    # The $SINGULARITY_CONTAINER variable is automatically set by Singularity.
+    container="${APPTAINER_CONTAINER:-${SINGULARITY_CONTAINER:-imam.sif}}"
+    container="$(basename "$container")"
+
     echo "IMAM Workflow Container - Version: $(cat /IMAM_VERSION)"
     echo "----------------------------------------------------"
     echo "This container provides a two-step metagenomic analysis workflow."
     echo
     echo "Usage:"
-    echo "  singularity run $(basename $SINGULARITY_CONTAINER) --version    # To see this container's version"
+    echo "  apptainer run \"$container\" --version"
     echo
     echo "Workflow Steps:"
     echo "  1. Prepare project directory:"
-    echo "     singularity exec $(basename $SINGULARITY_CONTAINER) python /prepare_project.py -p <project_dir> ..."
+    echo "     apptainer exec \"$container\" python /prepare_project.py -p <project_dir> ..."
     echo
     echo "  2. Run the Snakemake workflow:"
-    echo "     singularity exec $(basename $SINGULARITY_CONTAINER) snakemake --snakefile <project_dir>/Snakefile --cores <N>"
+    echo "     apptainer exec \"$container\" snakemake --snakefile <project_dir>/Snakefile --cores <N>"
     echo
+
+%test
+    set -eu
+
+    # Set explicitly because %environment is intended for runtime.
+    export PATH="/opt/conda/envs/imam/bin:${PATH}"
+    export PYTHONNOUSERSITE=1
+
+    python -c "import Bio; print('Biopython:', Bio.__version__)"
+
+    for tool in \
+        snakemake diamond spades.py cd-hit-dup fastp \
+        bwa seqkit samtools rsync kaiju
+    do
+        command -v "$tool" >/dev/null
+    done
+
+    snakemake --version
+    diamond version
+    spades.py --version
+    fastp --version
+    seqkit version
+    samtools --version
+    rsync --version
+
+    test -s /IMAM_VERSION
+    test -f /snakefile_imam.smk
+
+    echo "IMAM installation smoke tests passed."
