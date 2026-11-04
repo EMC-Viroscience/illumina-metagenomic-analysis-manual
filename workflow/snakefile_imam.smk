@@ -364,7 +364,7 @@ rule extract_viral_annotations:
         viral = "result/{sample}/annotation/viral_contigs.tsv"
     shell:
         '''
-        grep -E "*viria" {input.annotated} > {output.viral} || touch {output.viral}
+        grep -Ei "viria" {input.annotated} > {output.viral} || touch {output.viral}
         '''
 
 rule map_reads_to_contigs:
