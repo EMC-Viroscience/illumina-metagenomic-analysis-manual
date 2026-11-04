@@ -364,7 +364,7 @@ rule extract_viral_annotations:
         viral = "result/{sample}/annotation/viral_contigs.tsv"
     shell:
         '''
-        grep -E "*viria" {input.annotated} > {output.viral} || touch {output.viral}
+        grep -Ei "viria" {input.annotated} > {output.viral} || touch {output.viral}
         '''
 
 rule map_reads_to_contigs:
@@ -649,7 +649,7 @@ rule aggregate_viral_annotation:
         echo -e "Sample\\tContig_ID\\tContig_Length\\tRead_Count\\tsseqid\\tpident\\tlength\\tmismatch\\tgapopen\\tqstart\\tqend\\tsstart\\tsend\\tevalue\\tbitscore\\tstaxids\\ttaxon_name\\tspecies\\tgenus\\tfamily\\torder\\tclass\\tphylum\\tkingdom\\tsuperkingdom" > {output}
         
         # Concatenate all the per-sample files into the final report.
-        grep -E "*viria" {input} >> {output} || touch {output}
+        grep -Ei "viria" {input} >> {output} || touch {output}
         """
         
 rule annotate_reads:
